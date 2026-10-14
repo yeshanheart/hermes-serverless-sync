@@ -1,0 +1,12 @@
+# never commit your own Hermes data or sync artifacts
+state.db
+state.db-*
+*.db
+*.snapshot
+*.enc
+.env
+auth.json
+sync.log
+repo/
+snaprepo/
+dist/
