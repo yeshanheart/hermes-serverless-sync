@@ -6,6 +6,8 @@
     skills/ , memories/ , sessions/
   Secrets (encrypted before sync):
     .env , auth.json  ->  secrets/*.enc
+  Session store (encrypted before sync):
+    state.db snapshot ->  snapshots/<label>.db.enc   (branch: sessions-snapshot)
 
   Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -File sync-hermes.ps1 -Mode push
@@ -201,9 +203,12 @@ function Find-Python {
 }
 
 # Sessions live in state.db (SQLite). Sync = snapshot + additive merge.
-# Snapshots travel on a dedicated single-commit branch that is force-pushed, so
-# the git repo never grows: each machine owns  snapshots/<MACHINE>.db  and every
-# machine absorbs all *other* machines' snapshots (additive, tagged by source).
+# Snapshots travel on a dedicated single-commit branch that is force-pushed, so the
+# git repo never grows. Each machine owns snapshots/<label>.db.enc and absorbs all
+# *other* machines' snapshots (additive, tagged by source).
+# The snapshot holds RAW conversation text, so it is AES-encrypted before it is
+# published - the same treatment .env / auth.json get. A plaintext snapshots/*.db
+# left behind by an older peer is still read (legacy), but never produced.
 $SnapRepo   = Join-Path $SyncRoot 'snaprepo'
 $SnapBranch = 'sessions-snapshot'
 # label for THIS machine's snapshot file; peers use it as the import tag.
@@ -231,9 +236,20 @@ function Update-SnapRepo {
 }
 
 function Publish-Snapshot([string]$LocalSnap) {
+  if (-not $Passphrase) {
+    Log "no passphrase: refusing to publish the session snapshot in the clear"
+    return $false
+  }
   Update-SnapRepo
-  New-Item -ItemType Directory -Force -Path (Join-Path $SnapRepo 'snapshots') | Out-Null
-  Copy-Item $LocalSnap (Join-Path $SnapRepo ('snapshots\' + $SnapLabel + '.db')) -Force
+  $dir = Join-Path $SnapRepo 'snapshots'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  # retire this machine's plaintext snapshot - and any SQLite sidecars an older
+  # version may have committed; the snapshot must only ever travel encrypted
+  foreach ($suffix in @('.db', '.db-shm', '.db-wal')) {
+    $legacy = Join-Path $dir ($SnapLabel + $suffix)
+    if (Test-Path $legacy) { Remove-Item -Force $legacy }
+  }
+  Protect-File $LocalSnap (Join-Path $dir ($SnapLabel + '.db.enc')) $Passphrase
   & git.exe -C $SnapRepo add -A | Out-Null
   $msg = "session snapshot from {0} at {1}" -f $env:COMPUTERNAME, (Get-Date -Format 's')
   & git.exe -C $SnapRepo commit -m $msg | Out-Null
@@ -245,7 +261,7 @@ function Publish-Snapshot([string]$LocalSnap) {
     Start-Sleep -Seconds 5
   }
   if (-not $ok) { Log "snapshot publish failed (network?)"; return $false }
-  Log ("sessions: published snapshot as snapshots/" + $SnapLabel + ".db")
+  Log ("sessions: published encrypted snapshot as snapshots/" + $SnapLabel + ".db.enc")
   return $true
 }
 
@@ -253,8 +269,18 @@ function Get-RemoteSnapshots {
   Update-SnapRepo
   $d = Join-Path $SnapRepo 'snapshots'
   if (-not (Test-Path $d)) { return @() }
-  return @(Get-ChildItem -Path $d -Filter '*.db' -ErrorAction SilentlyContinue |
-    Where-Object { $_.BaseName -ne $SnapLabel })
+  $out = New-Object System.Collections.Generic.List[object]
+  foreach ($f in @(Get-ChildItem -Path $d -File -ErrorAction SilentlyContinue)) {
+    if ($f.Name -eq ($SnapLabel + '.db.enc') -or $f.Name -eq ($SnapLabel + '.db')) { continue }
+    if ($f.Name -like '*.db.enc') {
+      $out.Add([pscustomobject]@{
+        Label = $f.Name.Substring(0, $f.Name.Length - 7); Enc = $true; Path = $f.FullName })
+    } elseif ($f.Name -like '*.db') {
+      $out.Add([pscustomobject]@{
+        Label = $f.BaseName; Enc = $false; Path = $f.FullName })
+    }
+  }
+  return $out
 }
 
 function Do-Sessions {
@@ -267,11 +293,21 @@ function Do-Sessions {
   if ($LASTEXITCODE -ne 0) { Log ("snapshot failed (rc $LASTEXITCODE): " + ($sout -join ' ')); exit 1 }
   if ($sout) { Log (($sout -join ' ').Trim()) }
   if (-not (Publish-Snapshot $localSnap)) { Log "sessions: publish failed"; exit 1 }
-  $others = Get-RemoteSnapshots
+  $others = @(Get-RemoteSnapshots)
   if ($others.Count -eq 0) { Log "sessions: no snapshots from other machines yet"; Log "sessions: done"; return }
+  $work = Join-Path $SyncRoot 'tmp'
+  New-Item -ItemType Directory -Force -Path $work | Out-Null
   foreach ($o in $others) {
-    $mout = & $py $tool merge --snapshot $o.FullName --tag $o.BaseName 2>&1
-    Log ("merge " + $o.BaseName + " (rc $LASTEXITCODE): " + (($mout -join ' ').Trim()))
+    $plain = $o.Path
+    if ($o.Enc) {
+      if (-not $Passphrase) { Log ("skip " + $o.Label + ": snapshot is encrypted but no passphrase is set"); continue }
+      $plain = Join-Path $work ($o.Label + '.db')
+      try { Unprotect-File $o.Path $plain $Passphrase }
+      catch { Log ("decrypt failed for " + $o.Label + ": " + $_); continue }
+    }
+    $mout = & $py $tool merge --snapshot $plain --tag $o.Label 2>&1
+    Log ("merge " + $o.Label + " (rc $LASTEXITCODE): " + (($mout -join ' ').Trim()))
+    if ($o.Enc) { Remove-Item -Force $plain -ErrorAction SilentlyContinue }
   }
   Log "sessions: done"
 }

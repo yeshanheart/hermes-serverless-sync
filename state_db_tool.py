@@ -9,7 +9,10 @@ merge    : additively merge a snapshot into the local state.db
              (FTS/uid/display_order triggers then fire automatically)
            - --tag prefixes the inserted sessions' display_name/title so sessions
              from another machine stay categorised in the session list
-           - refuses to run while Hermes appears active (gateway pid / recent WAL)
+           - one transaction PER SESSION, so the SQLite write lock is never held for more
+             than a single session and a live Hermes never stalls past its ~1s busy timeout
+           - checks schema drift in BOTH directions and refuses rather than guessing
+           - optional --refuse-if-active aborts while Hermes looks active (gateway pid / WAL)
 
 Tables touched: sessions, messages, system_prompts, session_model_usage.
 Machine-local routing/runtime tables are deliberately skipped.
@@ -17,7 +20,6 @@ Machine-local routing/runtime tables are deliberately skipped.
 import argparse
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -39,6 +41,14 @@ def cols(conn, table):
     return [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)]
 
 
+def col_safe_to_omit(conn, table, name):
+    """True when INSERTing a row without this column cannot fail or misbehave."""
+    for _cid, cname, _typ, notnull, dflt, pk in conn.execute("PRAGMA table_info(%s)" % table):
+        if cname == name:
+            return (not notnull) or (dflt is not None) or bool(pk)
+    return True
+
+
 def table_exists(conn, table):
     return conn.execute(
         "select 1 from sqlite_master where type='table' and name=?", (table,)
@@ -46,6 +56,12 @@ def table_exists(conn, table):
 
 
 def pid_alive(pid):
+    if os.name != "nt":                      # POSIX (used by the CI runner)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "PID eq %d" % pid],
@@ -133,11 +149,25 @@ def cmd_merge(args):
             if not table_exists(loc, t) or not table_exists(snap, t):
                 print("ERROR: table %s missing on one side" % t)
                 return 1
-            extra = set(cols(snap, t)) - set(cols(loc, t))
+            s_cols_all, l_cols_all = set(cols(snap, t)), set(cols(loc, t))
+            extra = s_cols_all - l_cols_all          # snapshot NEWER than local
+            missing = l_cols_all - s_cols_all        # snapshot OLDER than local
             if extra:
-                print("ERROR: local %s lacks column(s) %s - Hermes versions differ, aborting."
-                     % (t, sorted(extra)))
+                print("ERROR: local %s lacks column(s) %s - this machine's Hermes is older,"
+                      " aborting." % (t, sorted(extra)))
+                print("       Upgrade Hermes here, or pass --allow-schema-skew.")
                 return 1
+            if missing:
+                unsafe = [c for c in sorted(missing) if not col_safe_to_omit(loc, t, c)]
+                if unsafe and not args.allow_schema_skew:
+                    print("ERROR: snapshot %s lacks column(s) %s that this machine has, and"
+                          " %s cannot be safely omitted (NOT NULL, no default) - aborting."
+                          % (t, sorted(missing), unsafe))
+                    print("       The other machine likely runs an older Hermes: upgrade it, or"
+                          " pass --allow-schema-skew to merge the common columns.")
+                    return 1
+                print("NOTE: snapshot %s lacks column(s) %s; merging the common columns."
+                      % (t, sorted(missing)))
 
         local_sessions = {r[0] for r in loc.execute("select id from sessions")}
         snap_sessions = {r[0] for r in snap.execute("select id from sessions")}
@@ -170,7 +200,9 @@ def cmd_merge(args):
         m_ph = ",".join("?" * len(m_ins))
 
         added_sessions = added_messages = 0
+        worst_ms = 0.0
         for sid in sorted(todo):
+            t0 = time.time()
             vals = dict(zip(s_cols, snap.execute(
                 "select %s from sessions where id=?" % ",".join(s_cols), (sid,)
             ).fetchone()))
@@ -221,8 +253,15 @@ def cmd_merge(args):
                         r,
                     )
 
-        loc.commit()
+            # One transaction PER SESSION. The SQLite write lock is therefore held for a single
+            # session at a time, so importing 200 sessions can no longer stall a live Hermes
+            # past its ~1s busy timeout. The merge stays idempotent, so an interrupted run
+            # simply continues on the next call.
+            loc.commit()
+            worst_ms = max(worst_ms, (time.time() - t0) * 1000.0)
+
         print("merged: %d session(s), %d message(s) added" % (added_sessions, added_messages))
+        print("longest single write transaction: %.0f ms" % worst_ms)
         return 0
     except Exception:
         loc.rollback()
@@ -247,6 +286,9 @@ def main():
     s2.add_argument("--tag", help="label prefixed to imported sessions (e.g. source machine)")
     s2.add_argument("--refuse-if-active", action="store_true",
                     help="abort instead of merging while Hermes looks active")
+    s2.add_argument("--allow-schema-skew", action="store_true",
+                    help="merge the common columns even when the snapshot is older than the"
+                         " local schema (default: abort unless the missing columns are optional)")
     s2.set_defaults(func=cmd_merge)
 
     a = p.parse_args()

@@ -10,3 +10,7 @@ sync.log
 repo/
 snaprepo/
 dist/
+
+# python
+__pycache__/
+*.pyc
