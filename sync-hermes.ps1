@@ -40,6 +40,62 @@ $SyncRoot = Join-Path $env:LOCALAPPDATA 'hermes\sync'
 $RepoDir  = Join-Path $SyncRoot 'repo'
 $LogFile  = Join-Path $SyncRoot 'sync.log'
 
+# ---------------- git transport (local proxy, auto-detected) ----------------
+# A local Clash/V2Ray-style proxy is common, and on some networks it is REQUIRED to reach
+# github.com. It must never be baked into git's global config: a stopped proxy would then
+# wedge every git call with "Could not connect to server" even after it is switched off.
+# Instead we probe the usual local ports once per run and inject -c http.proxy=... only
+# while one actually accepts connections; otherwise we connect directly. Starting or
+# stopping the proxy therefore needs no configuration change - the next run adapts.
+function Test-LocalPort([int]$Port) {
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $async = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(300)) { return $false }
+    $client.EndConnect($async)
+    return $true
+  } catch { return $false } finally { $client.Close() }
+}
+
+function Get-ProxyCandidates {
+  $ports = New-Object System.Collections.Generic.List[int]
+  try {
+    $reg = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+    if ($reg -and $reg.ProxyServer -match '(\d+)\s*$') { [void]$ports.Add([int]$Matches[1]) }
+  } catch { }
+  foreach ($p in @(7897, 7890, 7891, 10809, 10808, 1080, 8080, 8889, 20171)) {
+    if (-not $ports.Contains($p)) { [void]$ports.Add($p) }
+  }
+  return $ports
+}
+
+$ProxyUrl = $null
+foreach ($port in (Get-ProxyCandidates)) {
+  if (Test-LocalPort $port) { $ProxyUrl = "http://127.0.0.1:$port"; break }
+}
+# cap the connect phase so an unreachable remote fails in seconds instead of minutes
+$GitNetArgs = @('-c', 'http.connectTimeout=10')
+if ($ProxyUrl) { $GitNetArgs += @('-c', "http.proxy=$ProxyUrl", '-c', "https.proxy=$ProxyUrl") }
+
+# One quick reachability probe per run: an offline round (or a proxy that is not running)
+# must not burn three 21-second connect timeouts before giving up.
+function Test-RemoteReachable {
+  $target = 'github.com'
+  $port = 443
+  if ($ProxyUrl) {
+    $u = [System.Uri]$ProxyUrl
+    $target = $u.Host
+    $port = $u.Port
+  }
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $async = $client.BeginConnect($target, $port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(4000)) { return $false }
+    $client.EndConnect($async)
+    return $true
+  } catch { return $false } finally { $client.Close() }
+}
+
 # ---------------- manifest ----------------
 $IncludeFiles = @('config.yaml','SOUL.md','channel_directory.json')
 $IncludeDirs  = @('skills','memories','sessions')
@@ -87,7 +143,8 @@ function Unprotect-File([string]$InPath,[string]$OutPath,[string]$Pass) {
 # ---------------- git helpers ----------------
 function GitRun {
   param([Parameter(ValueFromRemainingArguments=$true)][string[]]$GitArgs)
-  $out = & git.exe -C $RepoDir @GitArgs 2>&1
+  $all = @($GitNetArgs) + $GitArgs
+  $out = & git.exe -C $RepoDir @all 2>&1
   $code = $LASTEXITCODE
   return [pscustomobject]@{ code = $code; out = ($out -join "`n") }
 }
@@ -164,6 +221,7 @@ function Restore-Payload {
 
 # ---------------- push / pull ----------------
 function Do-Push {
+  if (-not (Test-RemoteReachable)) { Log "remote unreachable (proxy down / offline): skipping push"; return }
   Ensure-Repo
   Stage-Payload
   GitRun 'add' '-A' | Out-Null
@@ -177,6 +235,7 @@ function Do-Push {
 }
 
 function Do-Pull {
+  if (-not (Test-RemoteReachable)) { Log "remote unreachable (proxy down / offline): skipping pull"; return }
   Ensure-Repo
   $pl = GitRun 'pull' '--no-rebase' '-X' 'theirs' 'origin' $Branch
   if ($pl.code -ne 0) { Log ("pull note: " + $pl.out) }
@@ -196,6 +255,8 @@ function Find-Python {
   }
   foreach ($p in $cands) {
     if ($p -like '*\WindowsApps\*') { continue }   # Store alias stub, not a real interpreter
+    # transient/staging copies (Hermes unpacks tools into .reclaim-* dirs that may vanish)
+    if ($p -like '*\.reclaim-*' -or $p -like '*\Temp\*' -or $p -like '*\tmp\*') { continue }
     $v = & $p -c "import sys; print(sys.version_info[0])" 2>&1
     if ($LASTEXITCODE -eq 0 -and (($v -join '') -match '^\d')) { return $p }
   }
@@ -218,7 +279,7 @@ $SnapLabel  = if ($env:HERMES_SYNC_LABEL) { $env:HERMES_SYNC_LABEL } else { $env
 function Ensure-SnapRepo {
   if (Test-Path (Join-Path $SnapRepo '.git')) { return }
   New-Item -ItemType Directory -Force -Path $SnapRepo | Out-Null
-  & git.exe clone --depth 1 --branch $SnapBranch $Remote $SnapRepo 2>&1 | Out-Null
+  & git.exe @GitNetArgs clone --depth 1 --branch $SnapBranch $Remote $SnapRepo 2>&1 | Out-Null
   if (-not (Test-Path (Join-Path $SnapRepo '.git'))) {
     Remove-Item -Recurse -Force $SnapRepo -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $SnapRepo | Out-Null
@@ -231,13 +292,17 @@ function Ensure-SnapRepo {
 
 function Update-SnapRepo {
   Ensure-SnapRepo
-  & git.exe -C $SnapRepo fetch --depth 1 origin $SnapBranch 2>&1 | Out-Null
+  & git.exe -C $SnapRepo @GitNetArgs fetch --depth 1 origin $SnapBranch 2>&1 | Out-Null
   & git.exe -C $SnapRepo reset --hard FETCH_HEAD 2>&1 | Out-Null
 }
 
 function Publish-Snapshot([string]$LocalSnap) {
   if (-not $Passphrase) {
     Log "no passphrase: refusing to publish the session snapshot in the clear"
+    return $false
+  }
+  if (-not (Test-RemoteReachable)) {
+    Log "remote unreachable (proxy down / offline): skipping snapshot publish"
     return $false
   }
   Update-SnapRepo
@@ -255,7 +320,7 @@ function Publish-Snapshot([string]$LocalSnap) {
   & git.exe -C $SnapRepo commit -m $msg | Out-Null
   $ok = $false
   for ($i = 1; $i -le 3; $i++) {
-    $r = & git.exe -C $SnapRepo push --force origin $SnapBranch 2>&1
+    $r = & git.exe -C $SnapRepo @GitNetArgs push --force origin $SnapBranch 2>&1
     if ($LASTEXITCODE -eq 0) { $ok = $true; break }
     Log ("snapshot push attempt $i failed: " + ($r -join ' '))
     Start-Sleep -Seconds 5
@@ -319,6 +384,8 @@ if (-not (Get-Command git.exe -ErrorAction SilentlyContinue) -and -not (Get-Comm
 }
 New-Item -ItemType Directory -Force -Path $SyncRoot | Out-Null
 Log "=== start $Mode (HERMES_HOME=$HermesHome) ==="
+if ($ProxyUrl) { Log ("git transport: local proxy " + $ProxyUrl + " (auto-detected)") }
+else { Log "git transport: direct (no local proxy listening)" }
 switch ($Mode) {
   'push' { Do-Push }
   'pull' { Do-Pull }
