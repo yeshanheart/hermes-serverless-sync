@@ -1,5 +1,7 @@
 # hermes-serverless-sync
 
+[![CI](https://github.com/yeshanheart/hermes-serverless-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/yeshanheart/hermes-serverless-sync/actions/workflows/ci.yml)
+
 **Two-way sync of a [Hermes Agent](https://hermes-agent.nousresearch.com/docs) install across machines through a private Git repo — no server, no database, no admin rights.**
 
 And it does the part most projects skip: **conversation history (`state.db`) is merged additively**, instead of overwriting one machine with the other or giving up on sessions entirely.
